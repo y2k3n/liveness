@@ -11,9 +11,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <queue>
 #include <set>
-#include <set>
-// #include <unordered_map>
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -31,12 +31,12 @@ std::set<BasicBlock *> findExitBBs(Function &func) {
 // PhiDefs(B) the variables defined by φ-functions at the entry of block B
 // PhiUses(B) the set of variables used in a φ-function at the entry of a
 // successor of the block B
-void findUSEsDEFs(
-    Function &func, std::unordered_map<BasicBlock *, std::set<Value *>> &USEs,
-    std::unordered_map<BasicBlock *, std::set<Value *>> &DEFs,
-    std::unordered_map<BasicBlock *, std::set<Value *>> &phiUSEs,
-    std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs,
-    std::set<BasicBlock *> &sideBB) {
+void findUSEsDEFs(Function &func,
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &USEs,
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &DEFs,
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &phiUSEs,
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs,
+                  std::set<BasicBlock *> &sideBBs) {
   for (auto &BB : func) {
     auto &DEF = DEFs[&BB];
     auto &USE = USEs[&BB];
@@ -62,7 +62,7 @@ void findUSEsDEFs(
     for (; iter != BB.end(); ++iter) {
       auto &inst = *iter;
       if (inst.mayHaveSideEffects())
-        sideBB.insert(&BB);
+        sideBBs.insert(&BB);
 
       for (auto &oprand : inst.operands()) {
         Value *val = oprand.get();
@@ -82,15 +82,24 @@ void findUSEsDEFs(
 void findLiveVars(Function &func) {
   std::unordered_map<BasicBlock *, std::set<Value *>> USEs, DEFs, phiUSEs,
       phiDEFs;
-  std::set<BasicBlock *> sideBB;
-  findUSEsDEFs(func, USEs, DEFs, phiUSEs, phiDEFs, sideBB);
-  std::set<BasicBlock *> worklist = findExitBBs(func);
-  worklist.insert(sideBB.begin(), sideBB.end());
+  std::set<BasicBlock *> sideBBs;
+  findUSEsDEFs(func, USEs, DEFs, phiUSEs, phiDEFs, sideBBs);
+  std::queue<BasicBlock *> worklist;
+  std::unordered_set<BasicBlock *> hashWL;
+  auto exitBBs = findExitBBs(func);
+  for (BasicBlock *eBB : exitBBs) {
+    if (hashWL.insert(eBB).second)
+      worklist.push(eBB);
+  }
+  for (BasicBlock *sBB : sideBBs) {
+    if (hashWL.insert(sBB).second)
+      worklist.push(sBB);
+  }
 
   std::unordered_map<BasicBlock *, std::set<Value *>> INs, OUTs;
   while (!worklist.empty()) {
-    BasicBlock *BB = *worklist.begin();
-    worklist.erase(BB);
+    BasicBlock *BB = worklist.front();
+    worklist.pop();
 
     // LiveOut(B) = ⋃_S∈succs(B) (LiveIn(S) \ PhiDefs(S)) ∪ PhiUses(B)
     // LiveIn(B) = PhiDefs(B) ∪ UpwardExposed(B) ∪ (LiveOut(B) \ Defs(B))
@@ -115,7 +124,8 @@ void findLiveVars(Function &func) {
 
     if (changed) {
       for (BasicBlock *pred : predecessors(BB)) {
-        worklist.insert(pred);
+        if (hashWL.insert(pred).second)
+          worklist.push(pred);
       }
     }
   }
@@ -171,16 +181,11 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  // auto &func_list = module->getFunctionList();
   for (auto &func : *module) {
     if (func.isDeclaration())
       continue;
     outs() << "Function: " << func.getName().data() << "\n";
     findLiveVars(func);
-    // auto exitBBs = findExitBBs(func);
-    // for (auto &BB : func) {
-    //   outs() << BB;
-    // }
     outs() << "******************************** " << func.getName().data()
            << "\n";
   }

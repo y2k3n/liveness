@@ -1,39 +1,32 @@
 #include <stdio.h>
-#include <stdlib.h>
-
-int global_var = 0;
-
-void update_global(int *ptr) { *ptr += 1; }
 
 int main() {
-  int a = 1, b = 2, c = 0;
+    // int n, i;
+    // int a = 0, b = 1, next;
 
-  if (a > b) {
-    c = a;
-  } else {
-    c = b;
-  }
+    // printf("Enter the number of Fibonacci terms to display: ");
+    // scanf("%d", &n);
 
-  for (int i = 0; i < 10; ++i) {
-    printf("i = %d\n", i);
-    global_var += i;
-  }
+    // if (n <= 0) {
+    //     printf("Please enter a positive integer.\n");
+    //     return 1;
+    // }
 
-  int *ptr = &a;
-  *ptr = 100;
+    // printf("Fibonacci Series: ");
 
-  update_global(&global_var);
+    // for (i = 0; i < n; i++) {
+    //     printf("%d ", a);
+    //     next = a + b;
+    //     a = b;
+    //     b = next;
+    // }
 
-  while (global_var < 20) {
-    if (global_var % 2 == 0) {
-      b += global_var;
-    } else {
-      a += global_var;
+    // printf("\n");
+    // return 0;
+    int n;
+    scanf("%d", &n);
+    for (int i = 1; i < 100; ++i) {
+      printf("%d %d %d\n", i, n, i * n);
     }
-    global_var++;
-  }
-
-  printf("Final: a=%d, b=%d, c=%d\n", a, b, c);
-
-  return a + b + c;
+    return n;
 }

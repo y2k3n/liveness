@@ -162,9 +162,9 @@ int main(int argc, char *argv[]) {
   std::vector<std::future<void>> futures;
   futures.reserve(module->size());
   for (auto [i, func] : enumerate(*module)) {
-    futures.push_back(std::async(std::launch::async, findLiveVars,
-                                 std::ref(func), std::ref(funcINs[i]),
-                                 std::ref(funcOUTs[i])));
+    futures.push_back(std::async(std::launch::async | std::launch::deferred,
+                                 findLiveVars, std::ref(func),
+                                 std::ref(funcINs[i]), std::ref(funcOUTs[i])));
   }
   for (auto &future : futures) {
     future.get();

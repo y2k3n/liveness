@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <memory>
 #include <set>
+#include <set>
 // #include <unordered_map>
 
 using namespace llvm;
@@ -34,7 +35,8 @@ void findUSEsDEFs(
     Function &func, std::unordered_map<BasicBlock *, std::set<Value *>> &USEs,
     std::unordered_map<BasicBlock *, std::set<Value *>> &DEFs,
     std::unordered_map<BasicBlock *, std::set<Value *>> &phiUSEs,
-    std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs) {
+    std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs,
+    std::set<BasicBlock *> &sideBB) {
   for (auto &BB : func) {
     auto &DEF = DEFs[&BB];
     auto &USE = USEs[&BB];
@@ -59,6 +61,9 @@ void findUSEsDEFs(
 
     for (; iter != BB.end(); ++iter) {
       auto &inst = *iter;
+      if (inst.mayHaveSideEffects())
+        sideBB.insert(&BB);
+
       for (auto &oprand : inst.operands()) {
         Value *val = oprand.get();
         if (isa<Instruction>(val) || isa<Argument>(val)) {
@@ -77,8 +82,10 @@ void findUSEsDEFs(
 void findLiveVars(Function &func) {
   std::unordered_map<BasicBlock *, std::set<Value *>> USEs, DEFs, phiUSEs,
       phiDEFs;
-  findUSEsDEFs(func, USEs, DEFs, phiUSEs, phiDEFs);
+  std::set<BasicBlock *> sideBB;
+  findUSEsDEFs(func, USEs, DEFs, phiUSEs, phiDEFs, sideBB);
   std::set<BasicBlock *> worklist = findExitBBs(func);
+  worklist.insert(sideBB.begin(), sideBB.end());
 
   std::unordered_map<BasicBlock *, std::set<Value *>> INs, OUTs;
   while (!worklist.empty()) {
@@ -87,7 +94,8 @@ void findLiveVars(Function &func) {
 
     // LiveOut(B) = ⋃_S∈succs(B) (LiveIn(S) \ PhiDefs(S)) ∪ PhiUses(B)
     // LiveIn(B) = PhiDefs(B) ∪ UpwardExposed(B) ∪ (LiveOut(B) \ Defs(B))
-    std::set<Value *> oldIN = INs[BB], oldOUT = OUTs[BB];
+    // std::set<Value *> oldIN = INs[BB], oldOUT = OUTs[BB];
+    bool changed = false;
     std::set<Value *> liveIN, liveOUT;
     liveOUT = phiUSEs[BB];
     for (BasicBlock *succ : successors(BB)) {
@@ -95,15 +103,17 @@ void findLiveVars(Function &func) {
                           phiDEFs[succ].begin(), phiDEFs[succ].end(),
                           std::inserter(liveOUT, liveOUT.end()));
     }
+    changed |= (OUTs[BB] != liveOUT);
     OUTs[BB] = liveOUT;
 
     liveIN = phiDEFs[BB];
     std::set_difference(OUTs[BB].begin(), OUTs[BB].end(), DEFs[BB].begin(),
                         DEFs[BB].end(), std::inserter(liveIN, liveIN.end()));
     liveIN.insert(USEs[BB].begin(), USEs[BB].end());
+    changed |= (INs[BB] != liveIN);
     INs[BB] = liveIN;
 
-    if ((liveIN != oldIN) || (liveOUT != oldOUT)) {
+    if (changed) {
       for (BasicBlock *pred : predecessors(BB)) {
         worklist.insert(pred);
       }

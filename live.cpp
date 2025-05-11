@@ -10,6 +10,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <future>
 #include <memory>
 #include <queue>
 #include <set>
@@ -79,7 +81,12 @@ void findUSEsDEFs(Function &func,
   }
 }
 
-void findLiveVars(Function &func) {
+void findLiveVars(Function &func,
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &INs,
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &OUTs) {
+  if (func.isDeclaration())
+    return;
+
   std::unordered_map<BasicBlock *, std::set<Value *>> USEs, DEFs, phiUSEs,
       phiDEFs;
   std::set<BasicBlock *> sideBBs;
@@ -96,7 +103,7 @@ void findLiveVars(Function &func) {
       worklist.push(sBB);
   }
 
-  std::unordered_map<BasicBlock *, std::set<Value *>> INs, OUTs;
+  // std::unordered_map<BasicBlock *, std::set<Value *>> INs, OUTs;
   while (!worklist.empty()) {
     BasicBlock *BB = worklist.front();
     worklist.pop();
@@ -129,40 +136,6 @@ void findLiveVars(Function &func) {
       }
     }
   }
-
-  for (auto &BB : func) {
-    outs() << BB;
-    outs() << "IN set: ----------------\n";
-    for (auto in : INs[&BB]) {
-      outs() << *in << "\n";
-    }
-    outs() << "---------------- :IN set\n";
-    outs() << "OUT set: ++++++++++++++++\n";
-    for (auto out : OUTs[&BB]) {
-      outs() << *out << "\n";
-    }
-    outs() << "++++++++++++++++ :OUT set\n";
-    // outs() << "DEF set: ****************\n";
-    // for (auto def : DEFs[&BB]) {
-    //   outs() << *def << "\n";
-    // }
-    // outs() << "**************** :DEF set\n";
-    // outs() << "USE set: ****************\n";
-    // for (auto use : USEs[&BB]) {
-    //   outs() << *use << "\n";
-    // }
-    // outs() << "**************** :USE set\n";
-    // outs() << "phiDEF: ****************\n";
-    // for (auto def : phiDEFs[&BB]) {
-    //   outs() << *def << "\n";
-    // }
-    // outs() << "**************** :phiDEF\n";
-    // outs() << "phiUSE: ****************\n";
-    // for (auto use : phiUSEs[&BB]) {
-    //   outs() << *use << "\n";
-    // }
-    // outs() << "**************** :phiUSE\n";
-  }
 }
 
 int main(int argc, char *argv[]) {
@@ -181,12 +154,68 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  for (auto &func : *module) {
-    if (func.isDeclaration())
-      continue;
-    outs() << "Function: " << func.getName().data() << "\n";
-    findLiveVars(func);
+  std::vector<std::unordered_map<BasicBlock *, std::set<Value *>>> funcINs(
+      module->size()),
+      funcOUTs(module->size());
+  outs() << module->size() << " function(s), ";
+#ifdef LIVE_CONCURRENT
+  std::vector<std::future<void>> futures;
+  futures.reserve(module->size());
+  for (auto [i, func] : enumerate(*module)) {
+    futures.push_back(std::async(std::launch::async, findLiveVars,
+                                 std::ref(func), std::ref(funcINs[i]),
+                                 std::ref(funcOUTs[i])));
+  }
+  for (auto &future : futures) {
+    future.get();
+  }
+  outs() << "concurrent mode\n";
+
+#else
+  for (auto [i, func] : enumerate(*module)) {
+    findLiveVars(func, funcINs[i], funcOUTs[i]);
+  }
+  outs() << "sequential mode\n";
+#endif
+
+#ifndef NO_OUTPUT
+  for (auto [i, func] : enumerate(*module)) {
+    outs() << "\nFunction: " << func.getName().data() << "\n";
+    for (auto &BB : func) {
+      outs() << BB;
+      outs() << "IN set: ----------------\n";
+      for (auto in : funcINs[i][&BB]) {
+        outs() << *in << "\n";
+      }
+      outs() << "---------------- :IN set\n";
+      outs() << "OUT set: ++++++++++++++++\n";
+      for (auto out : funcOUTs[i][&BB]) {
+        outs() << *out << "\n";
+      }
+      outs() << "++++++++++++++++ :OUT set\n";
+      // outs() << "DEF set: ****************\n";
+      // for (auto def : DEFs[&BB]) {
+      //   outs() << *def << "\n";
+      // }
+      // outs() << "**************** :DEF set\n";
+      // outs() << "USE set: ****************\n";
+      // for (auto use : USEs[&BB]) {
+      //   outs() << *use << "\n";
+      // }
+      // outs() << "**************** :USE set\n";
+      // outs() << "phiDEF: ****************\n";
+      // for (auto def : phiDEFs[&BB]) {
+      //   outs() << *def << "\n";
+      // }
+      // outs() << "**************** :phiDEF\n";
+      // outs() << "phiUSE: ****************\n";
+      // for (auto use : phiUSEs[&BB]) {
+      //   outs() << *use << "\n";
+      // }
+      // outs() << "**************** :phiUSE\n";
+    }
     outs() << "******************************** " << func.getName().data()
            << "\n";
   }
+#endif
 }

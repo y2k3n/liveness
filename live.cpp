@@ -12,8 +12,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <thread>
@@ -25,6 +28,16 @@
 #endif
 
 using namespace llvm;
+
+std::mutex outsmtx;
+
+struct TaskInfo {
+  Function *func;
+  size_t size;
+  int index;
+
+  bool operator<(const TaskInfo &rhs) const { return size < rhs.size; }
+};
 
 std::set<BasicBlock *> findExitBBs(Function &func) {
   std::set<BasicBlock *> exitBBs;
@@ -40,11 +53,11 @@ std::set<BasicBlock *> findExitBBs(Function &func) {
 // PhiDefs(B) the variables defined by φ-functions at the entry of block B
 // PhiUses(B) the set of variables used in a φ-function at the entry of a
 // successor of the block B
-void findUSEsDEFs(Function &func,
-                  std::unordered_map<BasicBlock *, std::set<Value *>> &USEs,
-                  std::unordered_map<BasicBlock *, std::set<Value *>> &DEFs,
-                  std::unordered_map<BasicBlock *, std::set<Value *>> &phiUSEs,
-                  std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs) {
+void findUSEsDEFs(
+    Function &func, std::unordered_map<BasicBlock *, std::set<Value *>> &USEs,
+    std::unordered_map<BasicBlock *, std::set<Value *>> &DEFs,
+    std::unordered_map<BasicBlock *, std::set<Value *>> &phiUSEs,
+    std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs) {
   for (auto &BB : func) {
     auto &DEF = DEFs[&BB];
     auto &USE = USEs[&BB];
@@ -151,16 +164,76 @@ void findLiveVars(Function &func,
 }
 
 void threadedLiveVars(
-    std::vector<Function *> &funcList,
+    std::mutex &Qmutex, std::priority_queue<TaskInfo> &taskQ,
     std::vector<std::unordered_map<BasicBlock *, std::set<Value *>>> &funcINs,
     std::vector<std::unordered_map<BasicBlock *, std::set<Value *>>> &funcOUTs,
     int tid) {
-  int nfuncs = funcList.size();
-  int i = tid;
-  while (i < nfuncs) {
-    findLiveVars(*funcList[i], funcINs[i], funcOUTs[i]);
-    i += NTHREADS;
+  auto start = std::chrono::high_resolution_clock::now();
+  int max_time = 0;
+  int max_size = 0;
+  int task_count = 0;
+  int total_size = 0;
+  int total_size_sq = 0;
+  int total_time = 0;
+  int total_time_sq = 0;
+
+  while (true) {
+    int index;
+    Function *func;
+    int size;
+    {
+      std::lock_guard<std::mutex> lock(Qmutex);
+      if (taskQ.empty())
+        break;
+      index = taskQ.top().index;
+      func = taskQ.top().func;
+      size = taskQ.top().size;
+      taskQ.pop();
+    }
+#ifdef PSTATS
+    auto sub_start = std::chrono::high_resolution_clock::now();
+#endif
+    findLiveVars(*func, funcINs[index], funcOUTs[index]);
+#ifdef PSTATS
+    auto sub_end = std::chrono::high_resolution_clock::now();
+    auto sub_duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(sub_end -
+        sub_start);
+    int time = sub_duration.count();
+    if (time > max_time){
+      max_time = time;
+      max_size = size;
+    }
+    task_count++;
+    total_size += size;
+    total_size_sq += size * size;
+    total_time += time;
+    total_time_sq += time * time;
+#endif
   }
+
+#ifdef PSTATS
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+  int mean_size = total_size / task_count;
+  int var_size = (total_size_sq / task_count) - (mean_size * mean_size);
+  int mean_time = total_time / task_count;
+  int var_time = (total_time_sq / task_count) - (mean_time * mean_time);
+
+  {
+    std::lock_guard<std::mutex> lock(outsmtx);
+    outs() << "\nThread " << tid << "\ttime:\t" << duration.count() << " ms\n";
+    outs() << "Max task time :\t " << max_time << " ms with\t " << max_size
+           << " BBs\n";
+    outs() << "Tasks processed:\t" << task_count << "\n";
+    outs() << "Task size mean:\t" << mean_size << ", var:\t" << var_size
+           << ", std dev:\t" << (int)std::sqrt(var_size) << "\n";
+    outs() << "Task time mean:\t" << mean_time << ", var:\t" << var_time
+           << ", std dev:\t" << (int)std::sqrt(var_time) << "\n";
+  }
+#endif
 }
 
 int main(int argc, char *argv[]) {
@@ -188,37 +261,58 @@ int main(int argc, char *argv[]) {
 
 // #define LIVE_CONCURRENT
 #ifdef LIVE_CONCURRENT
-  std::vector<Function *> funcList;
-  funcList.reserve(module->size());
-  for (auto &func : *module) {
-    funcList.emplace_back(&func);
+  outs() << "concurrent mode\n";
+  std::priority_queue<TaskInfo> taskQ;
+  for (auto [i, func] : enumerate(*module)) {
+    if (func.isDeclaration())
+      continue;
+    taskQ.push({&func, func.size(), (int)i});
   }
 
+  std::mutex Qmutex;
   std::vector<std::thread> threads;
   threads.reserve(NTHREADS);
   for (int i = 0; i < NTHREADS; ++i) {
-    threads.emplace_back(threadedLiveVars, std::ref(funcList),
+    threads.emplace_back(threadedLiveVars, std::ref(Qmutex), std::ref(taskQ),
                          std::ref(funcINs), std::ref(funcOUTs), i);
   }
   for (auto &t : threads) {
     t.join();
   }
 
-  outs() << "concurrent mode\n";
-
 #else
-  for (auto [i, func] : enumerate(*module)) {
-    findLiveVars(func, funcINs[i], funcOUTs[i]);
-  }
   outs() << "sequential mode\n";
+  std::string csvname = std::string(argv[1]) + ".csv";
+  std::ofstream csv(csvname);
+  csv << "name,size,time(us)\n";
+#ifndef RUN_COUNT
+#define RUN_COUNT 1
+#endif
+
+  for (auto [i, func] : enumerate(*module)) {
+    std::string fname = func.getName().str();
+    size_t fsize = func.size();
+    int tftime = 0;
+    for (int r = 0; r < RUN_COUNT; ++r) {
+      auto fstart = std::chrono::high_resolution_clock::now();
+      findLiveVars(func, funcINs[i], funcOUTs[i]);
+      auto fend = std::chrono::high_resolution_clock::now();
+      auto ftime =
+          std::chrono::duration_cast<std::chrono::microseconds>(fend - fstart)
+              .count();
+      tftime += ftime;
+    }
+    tftime /= RUN_COUNT;
+    csv << fname << "," << fsize << "," << tftime << "\n";
+  }
 #endif
 
   outs() << funcINs.size() << "=" << funcOUTs.size() << " results\n";
 
   auto end = std::chrono::high_resolution_clock::now();
   auto duration =
-      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  outs() << "Analysis time: " << duration.count() << " ns\n";
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+  outs() << "Analysis time: " << duration.count() << " ms\n";
 
 #ifndef NO_OUTPUT
   for (auto [i, func] : enumerate(*module)) {

@@ -1,3 +1,4 @@
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Instruction.h"
@@ -10,12 +11,18 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
-#include <future>
 #include <memory>
 #include <queue>
 #include <set>
+#include <thread>
 #include <unordered_set>
+#include <vector>
+
+#ifndef NTHREADS
+#define NTHREADS 16
+#endif
 
 using namespace llvm;
 
@@ -37,8 +44,7 @@ void findUSEsDEFs(Function &func,
                   std::unordered_map<BasicBlock *, std::set<Value *>> &USEs,
                   std::unordered_map<BasicBlock *, std::set<Value *>> &DEFs,
                   std::unordered_map<BasicBlock *, std::set<Value *>> &phiUSEs,
-                  std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs,
-                  std::set<BasicBlock *> &sideBBs) {
+                  std::unordered_map<BasicBlock *, std::set<Value *>> &phiDEFs) {
   for (auto &BB : func) {
     auto &DEF = DEFs[&BB];
     auto &USE = USEs[&BB];
@@ -63,8 +69,8 @@ void findUSEsDEFs(Function &func,
 
     for (; iter != BB.end(); ++iter) {
       auto &inst = *iter;
-      if (inst.mayHaveSideEffects())
-        sideBBs.insert(&BB);
+      // if (inst.mayHaveSideEffects())
+      //   sideBBs.insert(&BB);
 
       for (auto &oprand : inst.operands()) {
         Value *val = oprand.get();
@@ -90,23 +96,29 @@ void findLiveVars(Function &func,
   std::unordered_map<BasicBlock *, std::set<Value *>> USEs, DEFs, phiUSEs,
       phiDEFs;
   std::set<BasicBlock *> sideBBs;
-  findUSEsDEFs(func, USEs, DEFs, phiUSEs, phiDEFs, sideBBs);
+  findUSEsDEFs(func, USEs, DEFs, phiUSEs, phiDEFs);
   std::queue<BasicBlock *> worklist;
   std::unordered_set<BasicBlock *> hashWL;
-  auto exitBBs = findExitBBs(func);
-  for (BasicBlock *eBB : exitBBs) {
-    if (hashWL.insert(eBB).second)
-      worklist.push(eBB);
-  }
-  for (BasicBlock *sBB : sideBBs) {
-    if (hashWL.insert(sBB).second)
-      worklist.push(sBB);
+  // auto exitBBs = findExitBBs(func);
+  // for (BasicBlock *eBB : exitBBs) {
+  //   if (hashWL.insert(eBB).second)
+  //     worklist.push(eBB);
+  // }
+  // for (BasicBlock *sBB : sideBBs) {
+  //   if (hashWL.insert(sBB).second)
+  //     worklist.push(sBB);
+  // }
+  ReversePostOrderTraversal<Function *> RPOT(&func);
+  for (BasicBlock *BB : RPOT) {
+    if (hashWL.insert(BB).second)
+      worklist.push(BB);
   }
 
   // std::unordered_map<BasicBlock *, std::set<Value *>> INs, OUTs;
   while (!worklist.empty()) {
     BasicBlock *BB = worklist.front();
     worklist.pop();
+    hashWL.erase(BB);
 
     // LiveOut(B) = ⋃_S∈succs(B) (LiveIn(S) \ PhiDefs(S)) ∪ PhiUses(B)
     // LiveIn(B) = PhiDefs(B) ∪ UpwardExposed(B) ∪ (LiveOut(B) \ Defs(B))
@@ -138,6 +150,19 @@ void findLiveVars(Function &func,
   }
 }
 
+void threadedLiveVars(
+    std::vector<Function *> &funcList,
+    std::vector<std::unordered_map<BasicBlock *, std::set<Value *>>> &funcINs,
+    std::vector<std::unordered_map<BasicBlock *, std::set<Value *>>> &funcOUTs,
+    int tid) {
+  int nfuncs = funcList.size();
+  int i = tid;
+  while (i < nfuncs) {
+    findLiveVars(*funcList[i], funcINs[i], funcOUTs[i]);
+    i += NTHREADS;
+  }
+}
+
 int main(int argc, char *argv[]) {
   InitLLVM X(argc, argv);
   if (argc < 2) {
@@ -154,21 +179,31 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
+  auto start = std::chrono::high_resolution_clock::now();
+
   std::vector<std::unordered_map<BasicBlock *, std::set<Value *>>> funcINs(
       module->size()),
       funcOUTs(module->size());
   outs() << module->size() << " function(s), ";
+
+// #define LIVE_CONCURRENT
 #ifdef LIVE_CONCURRENT
-  std::vector<std::future<void>> futures;
-  futures.reserve(module->size());
-  for (auto [i, func] : enumerate(*module)) {
-    futures.push_back(std::async(std::launch::async | std::launch::deferred,
-                                 findLiveVars, std::ref(func),
-                                 std::ref(funcINs[i]), std::ref(funcOUTs[i])));
+  std::vector<Function *> funcList;
+  funcList.reserve(module->size());
+  for (auto &func : *module) {
+    funcList.emplace_back(&func);
   }
-  for (auto &future : futures) {
-    future.get();
+
+  std::vector<std::thread> threads;
+  threads.reserve(NTHREADS);
+  for (int i = 0; i < NTHREADS; ++i) {
+    threads.emplace_back(threadedLiveVars, std::ref(funcList),
+                         std::ref(funcINs), std::ref(funcOUTs), i);
   }
+  for (auto &t : threads) {
+    t.join();
+  }
+
   outs() << "concurrent mode\n";
 
 #else
@@ -177,6 +212,13 @@ int main(int argc, char *argv[]) {
   }
   outs() << "sequential mode\n";
 #endif
+
+  outs() << funcINs.size() << "=" << funcOUTs.size() << " results\n";
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  outs() << "Analysis time: " << duration.count() << " ns\n";
 
 #ifndef NO_OUTPUT
   for (auto [i, func] : enumerate(*module)) {
